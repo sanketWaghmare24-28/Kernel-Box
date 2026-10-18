@@ -694,6 +694,16 @@ node server.js
 ```
 Open **`http://localhost:8080`** in your browser.
 
+### 9.10 Running Regression Tests
+```bash
+cd dashboard
+npm test
+
+cd ..
+sh tests/run-linux-tests.sh
+```
+The dashboard tests use Node's built-in test runner. The C++ regression tests require Linux and `g++`.
+
 ---
 
 ## 10. Packaging & Sharing with a Friend

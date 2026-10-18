@@ -5,6 +5,7 @@
 #include <string>
 #include <cstdint>
 #include <sys/types.h>
+#include <utility>
 
 namespace kernelbox::cgroups {
 
@@ -18,6 +19,9 @@ struct CgroupStats {
 
 class CgroupManager {
 public:
+    explicit CgroupManager(std::string base_path = "/sys/fs/cgroup/kernelbox")
+        : base_path_(std::move(base_path)) {}
+
     /// Create cgroup directory for a container under /sys/fs/cgroup/kernelbox/<id>.
     bool create(const std::string& container_id);
 
@@ -37,7 +41,7 @@ public:
     bool remove(const std::string& container_id);
 
 private:
-    static constexpr const char* BASE_PATH = "/sys/fs/cgroup/kernelbox";
+    std::string base_path_;
     std::string cgroup_path(const std::string& container_id) const;
     bool        write_file(const std::string& path, const std::string& value);
     std::string read_file(const std::string& path);

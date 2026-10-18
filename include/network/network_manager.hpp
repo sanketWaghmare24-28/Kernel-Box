@@ -2,13 +2,22 @@
 // Manages virtual Ethernet pairs, bridge, and port forwarding for containers
 
 #pragma once
+#include <functional>
 #include <string>
 #include <sys/types.h>
+#include <utility>
+#include "../common.hpp"
 
 namespace kernelbox::network {
 
 class NetworkManager {
 public:
+    explicit NetworkManager(
+        std::function<bool(const std::string&)> command_runner = {},
+        std::string containers_dir = CONTAINERS_DIR)
+        : command_runner_(std::move(command_runner)),
+          containers_dir_(std::move(containers_dir)) {}
+
     /// Create the host bridge (kb0) with IP 10.0.100.1/24, enable forwarding.
     bool setup_bridge();
 
@@ -37,9 +46,15 @@ private:
     std::string bridge_subnet_ = "10.0.100.0/24";
     int next_ip_octet_ = 2;   // increments for each container
 
+    std::function<bool(const std::string&)> command_runner_;
+    std::string containers_dir_;
+
     bool        run_cmd(const std::string& cmd);
     std::string veth_host(const std::string& container_id);
     std::string veth_cont(const std::string& container_id);
+    bool remove_port_mapping(const std::string& host_port,
+                             const std::string& container_ip,
+                             const std::string& container_port);
 };
 
 } // namespace kernelbox::network

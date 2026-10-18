@@ -1,28 +1,29 @@
 const express = require('express');
-const { exec } = require('child_process');
+const { execFile } = require('child_process');
 const http = require('http');
 const path = require('path');
 const os = require('os');
-const fs = require('fs');
 
-const app = express();
 const PORT = 8080;
 
-app.use(express.json());
-app.use(express.static(path.join(__dirname, 'public')));
+const validContainerId = (id) => /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/.test(id);
 
-// Helper to run shell commands on host
-const runCmd = (cmd) => {
-    return new Promise((resolve) => {
-        exec(`sudo ../mini ${cmd}`, { cwd: __dirname }, (error, stdout, stderr) => {
-            if (error) {
-                console.error(`Error executing ${cmd}:`, stderr || error.message);
-                return resolve({ success: false, output: (stderr || error.message || '').trim() });
-            }
-            resolve({ success: true, output: (stdout || '').trim() });
+const createApp = (execFileImpl = execFile) => {
+    const app = express();
+    app.use(express.json());
+    app.use(express.static(path.join(__dirname, 'public')));
+
+    const runCmd = (command, args = []) => {
+        return new Promise((resolve) => {
+            execFileImpl('sudo', ['../mini', command, ...args], { cwd: __dirname }, (error, stdout, stderr) => {
+                if (error) {
+                    console.error(`Error executing ${command}:`, stderr || error.message);
+                    return resolve({ success: false, output: (stderr || error.message || '').trim() });
+                }
+                resolve({ success: true, output: (stdout || '').trim() });
+            });
         });
-    });
-};
+    };
 
 // 1. Get all containers
 app.get('/api/containers', async (req, res) => {
@@ -55,7 +56,10 @@ app.get('/api/containers', async (req, res) => {
 
 // 2. Get resource stats (cgroups v2)
 app.get('/api/stats/:id', async (req, res) => {
-    const { success, output } = await runCmd(`stats ${req.params.id}`);
+    if (!validContainerId(req.params.id)) {
+        return res.status(400).json({ error: 'Invalid container ID' });
+    }
+    const { success, output } = await runCmd('stats', [req.params.id]);
     if (!success) {
         return res.status(404).json({ error: 'Failed to fetch stats' });
     }
@@ -95,7 +99,10 @@ app.get('/api/stats/:id', async (req, res) => {
 
 // 3. Get container logs
 app.get('/api/logs/:id', async (req, res) => {
-    const { success, output } = await runCmd(`logs ${req.params.id}`);
+    if (!validContainerId(req.params.id)) {
+        return res.status(400).json({ error: 'Invalid container ID' });
+    }
+    const { success, output } = await runCmd('logs', [req.params.id]);
     if (!success) {
         return res.status(404).json({ error: 'Could not fetch logs', logs: [] });
     }
@@ -171,12 +178,18 @@ app.get('/api/health/:id', async (req, res) => {
 
 // 5. Container lifecycle controls
 app.post('/api/containers/:id/stop', async (req, res) => {
-    const { success, output } = await runCmd(`stop ${req.params.id}`);
+    if (!validContainerId(req.params.id)) {
+        return res.status(400).json({ error: 'Invalid container ID' });
+    }
+    const { success, output } = await runCmd('stop', [req.params.id]);
     res.json({ success, output });
 });
 
 app.post('/api/containers/:id/rm', async (req, res) => {
-    const { success, output } = await runCmd(`rm ${req.params.id}`);
+    if (!validContainerId(req.params.id)) {
+        return res.status(400).json({ error: 'Invalid container ID' });
+    }
+    const { success, output } = await runCmd('rm', [req.params.id]);
     res.json({ success, output });
 });
 
@@ -201,6 +214,13 @@ app.get('/api/system', (req, res) => {
     });
 });
 
-app.listen(PORT, () => {
-    console.log(`KernelBox Enhanced Dashboard running at http://localhost:${PORT}`);
-});
+    return app;
+};
+
+if (require.main === module) {
+    createApp().listen(PORT, () => {
+        console.log(`KernelBox Enhanced Dashboard running at http://localhost:${PORT}`);
+    });
+}
+
+module.exports = { createApp };
