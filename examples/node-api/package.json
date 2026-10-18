@@ -1,0 +1,11 @@
+{
+  "name": "kernelbox-demo-api",
+  "version": "1.0.0",
+  "description": "KernelBox demonstration Node.js HTTP service",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "author": "Sanket Waghmare",
+  "license": "MIT"
+}

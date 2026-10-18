@@ -1,0 +1,12 @@
+{
+  "name": "demo-api",
+  "version": "v1",
+  "base": "alpine",
+  "entrypoint": ["/usr/bin/node"],
+  "args": ["server.js"],
+  "working_dir": "/app",
+  "env": ["NODE_ENV=production", "PORT=3000"],
+  "exposed_ports": ["3000"],
+  "copy": ["."],
+  "description": "KernelBox Demo Node.js API"
+}

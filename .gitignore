@@ -1,0 +1,30 @@
+# Compiled binaries & object files
+mini
+*.o
+*.a
+*.so
+
+# Distribution archives & build output
+dist/
+*.tar.gz
+*.tar
+
+# Node.js dependencies & logs
+node_modules/
+dashboard/node_modules/
+examples/node-api/node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Temporary build & runtime directories
+rootfs_build/
+_import_tmp/
+logs/
+
+# System & Editor files
+.DS_Store
+*.swp
+*.swo
+.vscode/
+.idea/
