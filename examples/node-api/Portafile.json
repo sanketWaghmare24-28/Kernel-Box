@@ -8,5 +8,5 @@
     "env": ["NODE_ENV=production", "PORT=3000"],
     "exposed_ports": ["3000"],
     "copy": ["."],
-    "description": "Demo Node.js API for PortaRun"
+    "description": "Demo Node.js API for KernelBox (Portafile format)"
 }

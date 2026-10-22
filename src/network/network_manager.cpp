@@ -14,6 +14,10 @@
 #include <sys/wait.h>
 #include <cctype>
 #include <vector>
+#include <set>
+#include <cstring>
+#include <sys/file.h>
+#include <fcntl.h>
 
 namespace fs = std::filesystem;
 
@@ -160,36 +164,145 @@ bool NetworkManager::create_veth_pair(const std::string& container_id, pid_t pid
 
 // ── Container-side networking ────────────────────────────────────────────────
 
+// ── Container-side networking & IP allocation ────────────────────────────────
+
+std::string NetworkManager::allocate_ip(const std::string& container_id) {
+    if (!valid_container_id(container_id)) return "";
+
+    std::error_code ec;
+    fs::create_directories(containers_dir_, ec);
+    if (ec) {
+        log_error("Create containers directory: " + ec.message());
+        return "";
+    }
+
+    std::string lock_path = containers_dir_ + "/.network_ip_pool.lock";
+    int lock_fd = open(lock_path.c_str(), O_RDWR | O_CREAT, 0600);
+    if (lock_fd < 0) {
+        log_error("Open network IP pool lock: " + std::string(strerror(errno)));
+        return "";
+    }
+
+    if (flock(lock_fd, LOCK_EX) != 0) {
+        log_error("Lock network IP pool: " + std::string(strerror(errno)));
+        close(lock_fd);
+        return "";
+    }
+
+    struct LockGuard {
+        int fd;
+        ~LockGuard() {
+            flock(fd, LOCK_UN);
+            close(fd);
+        }
+    } guard{lock_fd};
+
+    // If this container already has an allocated valid IP, reuse it
+    std::string existing_ip = get_container_ip(container_id);
+    if (!existing_ip.empty() && valid_container_ip(existing_ip)) {
+        return existing_ip;
+    }
+
+    // Collect all currently assigned IPs across all containers in the directory
+    std::set<int> used_octets;
+    for (const auto& entry : fs::directory_iterator(containers_dir_, ec)) {
+        if (!entry.is_directory()) continue;
+        std::string other_id = entry.path().filename().string();
+        if (other_id == container_id) continue;
+        std::string other_conf = entry.path().string() + "/network.conf";
+        std::ifstream ifs(other_conf);
+        std::string other_ip;
+        if (ifs >> other_ip && valid_container_ip(other_ip)) {
+            auto last_dot = other_ip.rfind('.');
+            if (last_dot != std::string::npos) {
+                try {
+                    int octet = std::stoi(other_ip.substr(last_dot + 1));
+                    used_octets.insert(octet);
+                } catch (...) {}
+            }
+        }
+    }
+
+    int chosen_octet = -1;
+    for (int octet = IP_POOL_START; octet <= IP_POOL_END; ++octet) {
+        if (used_octets.find(octet) == used_octets.end()) {
+            chosen_octet = octet;
+            break;
+        }
+    }
+
+    if (chosen_octet == -1) {
+        log_error("Network IP pool exhausted (10.0.100.2-254)");
+        return "";
+    }
+
+    std::string allocated_ip = "10.0.100." + std::to_string(chosen_octet);
+    std::string conf_dir = containers_dir_ + "/" + container_id;
+    fs::create_directories(conf_dir, ec);
+    if (ec) {
+        log_error("Create network config directory: " + ec.message());
+        return "";
+    }
+
+    std::ofstream ofs(conf_dir + "/network.conf");
+    if (!ofs) {
+        log_error("Open network config for " + container_id);
+        return "";
+    }
+    ofs << allocated_ip << "\n";
+    ofs.flush();
+    if (!ofs) {
+        log_error("Write network config for " + container_id);
+        return "";
+    }
+
+    return allocated_ip;
+}
+
+bool NetworkManager::release_ip(const std::string& container_id) {
+    if (!valid_container_id(container_id)) return false;
+    std::string conf_dir = containers_dir_ + "/" + container_id;
+    std::error_code ec;
+    fs::remove(conf_dir + "/network.conf", ec);
+    if (ec && ec != std::errc::no_such_file_or_directory) {
+        log_error("Remove network config for " + container_id + ": " + ec.message());
+        return false;
+    }
+    return true;
+}
+
 bool NetworkManager::configure_container_network(const std::string& container_id, pid_t pid) {
     if (!valid_container_id(container_id) || pid <= 0) return false;
-    std::string ip = "10.0.100." + std::to_string(next_ip_octet_++);
+
+    std::string ip = allocate_ip(container_id);
+    if (ip.empty()) {
+        log_error("Failed to allocate IP address for container " + container_id);
+        return false;
+    }
+
     std::string vc = veth_cont(container_id);
     std::string ns = "nsenter -t " + std::to_string(pid) + " -n -- ";
 
     log_info("Configuring container network " + container_id + " → " + ip);
 
-    if (!run_cmd(ns + "ip addr add " + ip + "/24 dev " + vc))     return false;
-    if (!run_cmd(ns + "ip link set " + vc + " up"))                return false;
-    if (!run_cmd(ns + "ip link set lo up"))                        return false;
-    if (!run_cmd(ns + "ip route add default via " + bridge_ip_))   return false;
+    auto rollback = [&]() {
+        release_ip(container_id);
+    };
 
-    // Persist the assigned IP
-    std::string conf_dir = containers_dir_ + "/" + container_id;
-    std::error_code ec;
-    fs::create_directories(conf_dir, ec);
-    if (ec) {
-        log_error("Create network config directory: " + ec.message());
+    if (!run_cmd(ns + "ip addr add " + ip + "/24 dev " + vc)) {
+        rollback();
         return false;
     }
-    std::ofstream ofs(conf_dir + "/network.conf");
-    if (!ofs) {
-        log_error("Open network config for " + container_id);
+    if (!run_cmd(ns + "ip link set " + vc + " up")) {
+        rollback();
         return false;
     }
-    ofs << ip << "\n";
-    ofs.close();
-    if (!ofs) {
-        log_error("Write network config for " + container_id);
+    if (!run_cmd(ns + "ip link set lo up")) {
+        rollback();
+        return false;
+    }
+    if (!run_cmd(ns + "ip route add default via " + bridge_ip_)) {
+        rollback();
         return false;
     }
 
@@ -286,10 +399,7 @@ bool NetworkManager::cleanup(const std::string& container_id) {
     if (!run_cmd("ip link delete " + veth_host(container_id) + " 2>/dev/null")) {
         log_warn("Could not delete veth for " + container_id + " (it may already be absent)");
     }
-    std::error_code ec;
-    fs::remove(conf_dir + "/network.conf", ec);
-    if (ec) {
-        log_error("Remove network config for " + container_id + ": " + ec.message());
+    if (!release_ip(container_id)) {
         success = false;
     }
     return success;
