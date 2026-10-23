@@ -26,4 +26,8 @@ $(TARGET): $(OBJS)
 clean:
 	rm -f $(OBJS) $(TARGET)
 
-.PHONY: all clean
+test:
+	sh tests/run-linux-tests.sh
+	cd dashboard && npm test
+
+.PHONY: all clean test

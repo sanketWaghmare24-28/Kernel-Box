@@ -2,6 +2,7 @@
 // Orchestrates image, network, cgroups, process, and filesystem modules
 
 #include "../../include/runtime/container.hpp"
+#include "../../include/runtime/cgroup_cleanup_guard.hpp"
 #include "../../include/image/image_manager.hpp"
 #include "../../include/cgroups/cgroup_manager.hpp"
 #include "../../include/network/network_manager.hpp"
@@ -17,6 +18,7 @@
 #include <thread>
 #include <stdexcept>
 #include <cstring>
+#include <functional>
 #include <unistd.h>
 #include <sys/wait.h>
 #include <signal.h>
@@ -27,6 +29,22 @@
 namespace fs = std::filesystem;
 
 namespace kernelbox::runtime {
+
+namespace {
+
+class ScopeExit {
+public:
+    explicit ScopeExit(std::function<void()> cleanup)
+        : cleanup_(std::move(cleanup)) {}
+    ~ScopeExit() { if (active_) cleanup_(); }
+    void release() { active_ = false; }
+
+private:
+    std::function<void()> cleanup_;
+    bool active_ = true;
+};
+
+} // namespace
 
 // ── State I/O ────────────────────────────────────────────────────────────────
 
@@ -139,66 +157,99 @@ bool ContainerRuntime::start(const std::string& id_or_name) {
     if (!mf) throw std::runtime_error("Image manifest missing");
 
     cgroups::CgroupManager cm;
-    cm.create(id);
-    if (!s.cpu_limit.empty()) cm.set_cpu_limit(id, s.cpu_limit);
-    if (!s.memory_limit.empty()) cm.set_memory_limit(id, s.memory_limit);
+    if (!cm.create(id)) {
+        throw std::runtime_error("Failed to create cgroup for container " + id);
+    }
+    CgroupCleanupGuard cleanup_cgroup(cm, id);
+    if (!s.cpu_limit.empty() && !cm.set_cpu_limit(id, s.cpu_limit)) {
+        throw std::runtime_error("Failed to set CPU limit for container " + id);
+    }
+    if (!s.memory_limit.empty() && !cm.set_memory_limit(id, s.memory_limit)) {
+        throw std::runtime_error("Failed to set memory limit for container " + id);
+    }
 
     network::NetworkManager nm;
-    nm.setup_bridge();
+    if (!nm.setup_bridge()) {
+        throw std::runtime_error("Failed to set up container network bridge");
+    }
+    bool network_resources_owned = false;
+    ScopeExit cleanup_network([&nm, &id, &network_resources_owned]() {
+        if (network_resources_owned && !nm.cleanup(id)) {
+            log_error("Failed to clean up network for " + id);
+        }
+    });
 
     std::string rootfs_path = containers_dir_ + "/" + id + "/rootfs";
 
     logging::LogManager lm;
     lm.init(id);
     int log_fd = open(lm.get_log_path(id).c_str(), O_WRONLY | O_APPEND | O_CREAT, 0644);
-    if (log_fd < 0) throw std::runtime_error("Failed to open log file");
+    if (log_fd < 0) {
+        throw std::runtime_error("Failed to open log file: " + std::string(strerror(errno)));
+    }
+    ScopeExit close_log([log_fd]() { close(log_fd); });
 
     process::ProcessManager pm;
+    pid_t pid = -1;
+    ScopeExit cleanup_process([&pm, &pid]() {
+        if (pid > 0) {
+            pm.send_signal(pid, SIGKILL);
+            pm.wait_for(pid);
+        }
+    });
     int flags = CLONE_NEWNS | CLONE_NEWPID | CLONE_NEWUTS | CLONE_NEWIPC | CLONE_NEWNET;
 
     std::vector<std::string> cmd = mf->entrypoint;
     cmd.insert(cmd.end(), mf->args.begin(), mf->args.end());
 
-    pid_t pid = pm.spawn(
+    pid = pm.spawn(
         cmd, mf->env, mf->working_dir, s.name, flags,
         log_fd, log_fd,
-        [rootfs_path]() { // pre_exec_setup
-            filesystem::setup_mounts(rootfs_path);
-            filesystem::setup_dev(rootfs_path);
-            filesystem::do_pivot_root(rootfs_path);
+        [rootfs_path]() {
+            return filesystem::setup_mounts(rootfs_path) &&
+                   filesystem::setup_dev(rootfs_path) &&
+                   filesystem::do_pivot_root(rootfs_path);
+        },
+        [&cm, &id, &nm, &network_resources_owned, this](pid_t child_pid) {
+            if (!cm.add_process(id, child_pid)) return false;
+            if (!nm.create_veth_pair(id, child_pid)) return false;
+            network_resources_owned = true;
+            if (!nm.configure_container_network(id, child_pid)) return false;
+
+            const std::string ports_path = containers_dir_ + "/" + id + "/ports.conf";
+            std::ifstream pfs(ports_path);
+            std::error_code ec;
+            if (pfs.bad() || (fs::exists(ports_path, ec) && !pfs) || ec) return false;
+            std::string line;
+            const std::string cip = nm.get_container_ip(id);
+            while (std::getline(pfs, line)) {
+                const auto colon = line.find(':');
+                if (colon == std::string::npos ||
+                    !nm.add_port_mapping("0.0.0.0", line.substr(0, colon), cip,
+                                         line.substr(colon + 1))) {
+                    return false;
+                }
+            }
+            return !pfs.bad();
         }
     );
-
-    close(log_fd);
 
     if (pid <= 0) {
         throw std::runtime_error("Failed to spawn container process");
     }
 
-    // Host-side setup
-    cm.add_process(id, pid);
-    nm.create_veth_pair(id, pid);
-    nm.configure_container_network(id, pid);
-
-    // Apply port mappings
-    std::ifstream pfs(containers_dir_ + "/" + id + "/ports.conf");
-    std::string line;
-    std::string cip = nm.get_container_ip(id);
-    while (std::getline(pfs, line)) {
-        auto colon = line.find(':');
-        if (colon != std::string::npos) {
-            std::string hport = line.substr(0, colon);
-            std::string cport = line.substr(colon + 1);
-            // Forward port mapping
-            nm.add_port_mapping("0.0.0.0", hport, cip, cport);
-        }
-    }
-
     s.pid = pid;
     s.status = ContainerStatus::RUNNING;
-    save_state(s);
+    if (!save_state(s)) {
+        s.pid = 0;
+        s.status = ContainerStatus::CREATED;
+        throw std::runtime_error("Failed to save running state for container " + id);
+    }
 
     log_info("Container " + id + " started (PID: " + std::to_string(pid) + ")");
+    cleanup_process.release();
+    cleanup_network.release();
+    cleanup_cgroup.release();
     return true;
 }
 

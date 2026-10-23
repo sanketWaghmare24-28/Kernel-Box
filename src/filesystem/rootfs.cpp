@@ -29,12 +29,16 @@ bool prepare_rootfs(const std::string& rootfs_path) {
 
     for (const auto& dir : dirs) {
         fs::path p = fs::path(rootfs_path) / dir;
-        if (!fs::exists(p)) {
-            std::error_code ec;
-            if (!fs::create_directories(p, ec)) {
+        std::error_code ec;
+        if (!fs::exists(p, ec)) {
+            if (ec || !fs::create_directories(p, ec) || ec) {
                 log_error("Failed to create " + p.string() + ": " + ec.message());
                 return false;
             }
+        }
+        if (ec || !fs::is_directory(p, ec) || ec) {
+            log_error("Required rootfs path is not a directory: " + p.string());
+            return false;
         }
     }
 
@@ -43,6 +47,10 @@ bool prepare_rootfs(const std::string& rootfs_path) {
     fs::permissions(fs::path(rootfs_path) / "tmp",
                     fs::perms::all | fs::perms::sticky_bit,
                     fs::perm_options::replace, ec);
+    if (ec) {
+        log_error("Failed to set /tmp permissions: " + ec.message());
+        return false;
+    }
 
     log_info("Rootfs prepared at " + rootfs_path);
     return true;
@@ -62,7 +70,12 @@ bool setup_mounts(const std::string& rootfs_path) {
                         const char* type, unsigned long flags,
                         const char* data) -> bool {
         fs::path p = fs::path(rootfs_path) / target;
-        fs::create_directories(p); // ensure target exists
+        std::error_code ec;
+        fs::create_directories(p, ec);
+        if (ec || !fs::is_directory(p, ec) || ec) {
+            log_error("Prepare mount target " + target + ": " + ec.message());
+            return false;
+        }
         if (mount(src, p.c_str(), type, flags, data) != 0) {
             log_error("mount " + target + ": " + strerror(errno));
             return false;
@@ -140,7 +153,17 @@ bool do_pivot_root(const std::string& new_root) {
     // pivot_root requires a put_old directory inside new_root
     fs::path put_old = fs::path(new_root) / "put_old";
     std::error_code ec;
-    fs::create_directories(put_old, ec);
+    if (!fs::exists(put_old, ec)) {
+        if (ec || !fs::create_directories(put_old, ec) || ec) {
+            log_error("create put_old: " + ec.message());
+            return false;
+        }
+    }
+    if (ec || fs::is_symlink(fs::symlink_status(put_old, ec)) || ec ||
+        !fs::is_directory(put_old, ec) || ec) {
+        log_error("put_old is not a directory inside the new root");
+        return false;
+    }
 
     if (syscall(SYS_pivot_root, new_root.c_str(), put_old.c_str()) != 0) {
         log_error("pivot_root: " + std::string(strerror(errno)));

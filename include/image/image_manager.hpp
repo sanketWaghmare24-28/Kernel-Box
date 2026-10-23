@@ -11,6 +11,9 @@ namespace kernelbox::image {
 
 class ImageManager {
 public:
+    explicit ImageManager(std::string images_dir = IMAGES_DIR)
+        : images_dir_(std::move(images_dir)) {}
+
     /// Build an image from a context directory containing Boxfile.json (or Portafile.json).
     bool build(const std::string& context_dir, const std::string& tag);
 

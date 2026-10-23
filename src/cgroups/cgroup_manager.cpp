@@ -8,14 +8,27 @@
 #include <fstream>
 #include <sstream>
 #include <cstring>
+#include <cctype>
 #include <unistd.h>
 
 namespace fs = std::filesystem;
 
 namespace kernelbox::cgroups {
 
+namespace {
+
+bool valid_container_id(const std::string& id) {
+    if (id.size() != 12) return false;
+    for (unsigned char c : id) {
+        if (!std::isxdigit(c)) return false;
+    }
+    return true;
+}
+
+} // namespace
+
 std::string CgroupManager::cgroup_path(const std::string& container_id) const {
-    return std::string(BASE_PATH) + "/" + container_id;
+    return base_path_ + "/" + container_id;
 }
 
 bool CgroupManager::write_file(const std::string& path, const std::string& value) {
@@ -25,6 +38,7 @@ bool CgroupManager::write_file(const std::string& path, const std::string& value
         return false;
     }
     out << value;
+    out.flush();
     if (!out) {
         log_error("write " + path + " (data): " + strerror(errno));
         return false;
@@ -43,26 +57,43 @@ std::string CgroupManager::read_file(const std::string& path) {
 }
 
 bool CgroupManager::create(const std::string& container_id) {
+    if (!valid_container_id(container_id)) {
+        log_error("Invalid container ID for cgroup: " + container_id);
+        return false;
+    }
+
     std::error_code ec;
 
     // Create the kernelbox parent cgroup if needed
-    if (!fs::exists(BASE_PATH, ec)) {
-        if (!fs::create_directories(BASE_PATH, ec)) {
-            log_error("mkdir " + std::string(BASE_PATH) + ": " + ec.message());
+    if (!fs::exists(base_path_, ec)) {
+        if (ec || !fs::create_directories(base_path_, ec)) {
+            log_error("mkdir " + base_path_ + ": " + ec.message());
             return false;
         }
     }
+    if (ec || !fs::is_directory(base_path_, ec) || ec) {
+        log_error("Cgroup base is not a directory: " + base_path_);
+        return false;
+    }
 
     // Enable cpu + memory + pids controllers for children
-    write_file(std::string(BASE_PATH) + "/cgroup.subtree_control", "+cpu +memory +pids");
+    if (!write_file(base_path_ + "/cgroup.subtree_control", "+cpu +memory +pids")) {
+        log_error("Enable cgroup controllers under " + base_path_);
+        return false;
+    }
 
     // Create the per-container cgroup
     std::string path = cgroup_path(container_id);
+    ec.clear();
     if (!fs::exists(path, ec)) {
-        if (!fs::create_directories(path, ec)) {
+        if (ec || !fs::create_directories(path, ec)) {
             log_error("mkdir " + path + ": " + ec.message());
             return false;
         }
+    }
+    if (ec || !fs::is_directory(path, ec) || ec) {
+        log_error("Cgroup path is not a directory: " + path);
+        return false;
     }
 
     log_info("Created cgroup for " + container_id);
@@ -70,6 +101,7 @@ bool CgroupManager::create(const std::string& container_id) {
 }
 
 bool CgroupManager::set_cpu_limit(const std::string& container_id, const std::string& limit) {
+    if (!valid_container_id(container_id)) return false;
     if (limit.empty()) return true;
     std::string path = cgroup_path(container_id) + "/cpu.max";
     if (!write_file(path, limit)) {
@@ -81,6 +113,7 @@ bool CgroupManager::set_cpu_limit(const std::string& container_id, const std::st
 }
 
 bool CgroupManager::set_memory_limit(const std::string& container_id, const std::string& limit) {
+    if (!valid_container_id(container_id)) return false;
     if (limit.empty()) return true;
     std::string path = cgroup_path(container_id) + "/memory.max";
     if (!write_file(path, limit)) {
@@ -92,6 +125,7 @@ bool CgroupManager::set_memory_limit(const std::string& container_id, const std:
 }
 
 bool CgroupManager::add_process(const std::string& container_id, pid_t pid) {
+    if (!valid_container_id(container_id) || pid <= 0) return false;
     std::string path = cgroup_path(container_id) + "/cgroup.procs";
     if (!write_file(path, std::to_string(pid))) {
         log_error("add pid " + std::to_string(pid) + " to cgroup " + container_id);
@@ -128,6 +162,7 @@ CgroupStats CgroupManager::get_stats(const std::string& container_id) {
 }
 
 bool CgroupManager::remove(const std::string& container_id) {
+    if (!valid_container_id(container_id)) return false;
     std::string path = cgroup_path(container_id);
     std::error_code ec;
     if (fs::exists(path, ec)) {
@@ -138,7 +173,7 @@ bool CgroupManager::remove(const std::string& container_id) {
         log_info("Removed cgroup for " + container_id);
     }
     // Try to remove parent if empty (ignore errors)
-    rmdir(BASE_PATH);
+    rmdir(base_path_.c_str());
     return true;
 }
 

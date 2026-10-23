@@ -287,6 +287,9 @@ Here is a detailed line-by-line explanation of every major component in the proj
   - `get_int(json, key)`: Finds `"key": 123` and converts to integer.
   - `get_array(json, key)`: Parses arrays of strings such as `["node", "server.js"]`.
 
+> **Architectural Note (JSON vs SQLite):**
+> While an SQLite container registry was initially considered in preliminary project proposals, KernelBox deliberately adopts an air-gapped, zero-dependency filesystem metadata layout (`/var/lib/kernelbox/containers/<id>/state.json`, `network.conf`, `ports.conf`). This removes third-party C library linkage requirements, ensuring the runtime binary remains 100% self-contained, easily inspectable, and auditable on any minimal Linux environment.
+
 ---
 
 ### 5.2 `src/main.cpp`
@@ -449,9 +452,9 @@ Under cgroups v2, groups are represented as simple directories:
    ```bash
    ip link set vethXXXXXXc netns <container_pid>
    ```
-4. **Container Network Configuration:** Using `nsenter -t <pid> -n`, KernelBox sets up the interface inside the container:
+4. **Container Network Configuration & IP Pool:** KernelBox manages an atomic IP address pool (`10.0.100.2` to `10.0.100.254`) protected by file locking (`.network_ip_pool.lock`). Using `nsenter -t <pid> -n`, KernelBox sets up the interface inside the container:
    ```bash
-   ip addr add 10.0.100.2/24 dev vethXXXXXXc
+   ip addr add 10.0.100.X/24 dev vethXXXXXXc
    ip link set vethXXXXXXc up
    ip link set lo up
    ip route add default via 10.0.100.1
@@ -502,21 +505,21 @@ To prevent malicious tar archives (Zip-Slip vulnerability) from overwriting host
 ### 5.9 `src/logging/log_manager.cpp`
 **Purpose:** Captures container output reliably without blocking the main runtime.
 - Creates `/var/lib/kernelbox/containers/<id>/logs/container.log`.
-- In detached mode (`-d`), the container process's file descriptors `1` (stdout) and `2` (stderr) point directly to this log file.
-- Uses `flock(fd, LOCK_EX)` to ensure multiple processes writing to the log file do not corrupt lines.
-- Supports reading the last `N` lines (`tail` mode).
+- In detached mode (`-d`), the container process's file descriptors `1` (stdout) and `2` (stderr) are directly redirected to this log file at spawn time, ensuring zero overhead stream capture.
+- `LogManager::write()` is available for out-of-band operational event logging, utilizing `flock(fd, LOCK_EX)` for thread safety.
+- `LogManager::read()` supports reading container logs and tailing the last `N` lines.
 
 ---
 
 ### 5.10 `dashboard/`
 **Purpose:** A modern web-based monitoring console built with Node.js and Express.
 
-#### Architecture:
+#### Architecture & Scope:
 - `server.js`: Listens on `http://localhost:8080`. Implements REST endpoints:
-  - `GET /api/containers`: Calls `mini ps` and parses output.
+  - `GET /api/containers`: Calls `mini ps` and safely parses container table records.
   - `GET /api/stats/:id`: Calls `mini stats <id>` to retrieve cgroups CPU and memory metrics.
   - `GET /api/logs/:id`: Retrieves container stdout/stderr.
-  - `GET /api/health/:id`: Directly pings the container's internal HTTP server (`http://10.0.100.2:3000/health`) and measures response latency.
+  - `GET /api/health/:id`: Dynamically reads container IP and port mappings from metadata and probes `/health` with bounded timeouts.
   - `POST /api/containers/:id/stop`: Stops the container.
   - `POST /api/containers/:id/rm`: Removes the container.
 - `public/index.html`: Modern, responsive single-page application:
@@ -524,6 +527,9 @@ To prevent malicious tar archives (Zip-Slip vulnerability) from overwriting host
   - Live animated gauges for memory consumption vs limit.
   - Real-time API response inspection card.
   - Terminal modal window with live log stream filtering and copy controls.
+
+> **Operational Scope Notice:**
+> The web console acts as an observation, metrics inspection, and lifecycle termination console. Container creation (`mini run`) and image compilation (`mini build`) remain terminal CLI commands by architectural design to avoid exposing privileged root-level container generation over unauthenticated HTTP.
 
 ---
 
@@ -693,6 +699,22 @@ npm install
 node server.js
 ```
 Open **`http://localhost:8080`** in your browser.
+
+### 9.10 Running Regression Tests
+Run the complete automated test suite using the top-level Makefile:
+```bash
+make test
+```
+Or run individual suites:
+```bash
+# Dashboard security and integration unit tests
+cd dashboard && npm test
+
+# C++ kernel module tests (image validation, cgroups, process handshake, IP pool)
+cd ..
+sh tests/run-linux-tests.sh
+```
+The dashboard tests use Node.js's built-in test runner (`node --test`). The C++ regression tests require Linux and `g++`.
 
 ---
 
