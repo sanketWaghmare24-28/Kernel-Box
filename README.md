@@ -686,13 +686,44 @@ sudo ./mini stats demo-1
 sudo ./mini logs demo-1
 ```
 
-### 9.8 Stopping and Removing Containers
+### 9.8 Advanced Lifecycle: Create, Start, Pause, Exec & Restart
+KernelBox supports decoupled lifecycle management and state transitions:
 ```bash
-sudo ./mini stop demo-1
-sudo ./mini rm demo-1
+# 1. Decoupled create (prepares rootfs and metadata in state Created, no process spawned)
+sudo ./mini create demo-api:v1 --name demo-decoupled --memory 64m --publish 3050:3000
+
+# 2. Start the created container (spawns process, attaches cgroup & veth, enters Running)
+sudo ./mini start demo-decoupled
+
+# 3. Execute commands directly inside container namespaces
+sudo ./mini exec demo-decoupled uname -a
+sudo ./mini exec demo-decoupled /bin/sh -c "ps aux"
+
+# 4. Pause and unpause container processes via cgroup v2 freeze
+sudo ./mini pause demo-decoupled
+sudo ./mini inspect demo-decoupled | grep status  # reports "Paused"
+sudo ./mini unpause demo-decoupled
+
+# 5. Restart container (graceful stop + fresh child process with new PID)
+sudo ./mini restart demo-decoupled
+
+# 6. View full container JSON metadata (PID, IP, cgroups memory & CPU stats, ports)
+sudo ./mini inspect demo-decoupled
 ```
 
-### 9.9 Running the Web Dashboard
+### 9.9 Stopping and Removing Containers
+```bash
+# Graceful stop (sends SIGTERM, waits timeout, falls back to SIGKILL, cleans cgroups/veth)
+sudo ./mini stop demo-decoupled
+
+# Remove stopped container (purges rootfs, metadata, and logs)
+sudo ./mini rm demo-decoupled
+
+# Force remove a running container (automatically stops then removes)
+sudo ./mini rm demo-1 -f
+```
+
+### 9.10 Running the Web Dashboard
 ```bash
 cd dashboard
 npm install
@@ -700,21 +731,45 @@ node server.js
 ```
 Open **`http://localhost:8080`** in your browser.
 
-### 9.10 Running Regression Tests
-Run the complete automated test suite using the top-level Makefile:
+### 9.11 Running Regression & Scenario Verification Tests
+Run automated test suites using the top-level Makefile:
 ```bash
+# Core regression suite: C++ kernel module tests + Dashboard Node.js unit tests
 make test
-```
-Or run individual suites:
-```bash
-# Dashboard security and integration unit tests
-cd dashboard && npm test
 
-# C++ kernel module tests (image validation, cgroups, process handshake, IP pool)
-cd ..
-sh tests/run-linux-tests.sh
+# Scenario E: Container Networking test (dual containers, ICMP ping, HTTP over kb0, targeted teardown)
+make test-networking
+
+# Scenario F: Rootfs Template Cache & Concurrency test (cache generation, hit verification, mutation isolation, invalidation)
+make test-cache
+
+# Scenario G: Container Lifecycle test (create, start, pause, unpause, restart, stop, rm, state checks)
+make test-lifecycle
 ```
-The dashboard tests use Node.js's built-in test runner (`node --test`). The C++ regression tests require Linux and `g++`.
+Or run individual scenario test scripts directly:
+```bash
+# Scenario A: Namespace isolation boundaries (UTS hostname, PID visibility, mount isolation)
+sudo bash tests/test_scenario_a_isolation.sh
+
+# Scenario B: Cgroups v2 resource limits (cpu.max quota, memory.max ceiling, OOM kill tracking)
+sudo bash tests/test_scenario_b_cgroups.sh
+
+# Scenario C: Container crash detection and automatic resource cleanup
+sudo bash tests/test_scenario_c_crash.sh
+
+# Scenario D: Startup failure rollback and port collision recovery
+sudo bash tests/test_scenario_d_rollback.sh
+
+# Scenario E: Inter-container networking and bridge kb0 verification
+sudo bash tests/test_scenario_e_networking.sh
+
+# Scenario F: Performance benchmarking & rootfs template cache
+sudo bash tests/test_scenario_f_cache.sh
+sudo bash scripts/benchmark.sh scripts/benchmark_optimized.csv
+
+# Scenario G: Complete decoupled lifecycle and state transitions
+sudo bash tests/test_scenario_g_lifecycle.sh
+```
 
 ---
 

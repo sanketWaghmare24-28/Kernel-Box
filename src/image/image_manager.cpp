@@ -13,6 +13,9 @@
 #include <cctype>
 #include <cstring>
 #include <sys/wait.h>
+#include <sys/file.h>
+#include <sys/stat.h>
+#include <fcntl.h>
 #include <unistd.h>
 
 namespace fs = std::filesystem;
@@ -109,6 +112,102 @@ bool valid_tag(const std::string& tag) {
             return false;
         }
     }
+    return true;
+}
+
+std::string compute_cache_stamp(const fs::path& tarball, const fs::path& manifest_path) {
+    struct stat st;
+    if (stat(tarball.c_str(), &st) != 0) {
+        return "";
+    }
+    std::string stamp = "size=" + std::to_string(st.st_size) +
+                        ";mtime=" + std::to_string(st.st_mtim.tv_sec) + "." + std::to_string(st.st_mtim.tv_nsec);
+    if (fs::exists(manifest_path)) {
+        struct stat mst;
+        if (stat(manifest_path.c_str(), &mst) == 0) {
+            stamp += ";manifest_size=" + std::to_string(mst.st_size) +
+                     ";manifest_mtime=" + std::to_string(mst.st_mtim.tv_sec) + "." + std::to_string(mst.st_mtim.tv_nsec);
+        }
+    }
+    return stamp;
+}
+
+bool is_cache_valid(const fs::path& cache_dir, const fs::path& stamp_file, const std::string& expected_stamp) {
+    if (expected_stamp.empty()) return false;
+    std::error_code ec;
+    if (!fs::is_directory(cache_dir, ec) || ec) return false;
+    if (fs::is_empty(cache_dir, ec) || ec) return false;
+    if (!fs::exists(stamp_file, ec) || ec) return false;
+    std::ifstream ifs(stamp_file);
+    if (!ifs.is_open()) return false;
+    std::string current_stamp;
+    std::getline(ifs, current_stamp);
+    return (current_stamp == expected_stamp);
+}
+
+bool ensure_cache(const fs::path& image_dir, const fs::path& tarball, const fs::path& manifest_path) {
+    fs::path lock_file = image_dir / ".cache.lock";
+    int lock_fd = open(lock_file.c_str(), O_CREAT | O_RDWR | O_CLOEXEC, 0644);
+    if (lock_fd < 0) {
+        log_warn("Failed to open cache lock file: " + lock_file.string());
+        return false;
+    }
+
+    struct LockGuard {
+        int fd;
+        ~LockGuard() {
+            flock(fd, LOCK_UN);
+            close(fd);
+        }
+    } guard{lock_fd};
+
+    if (flock(lock_fd, LOCK_EX) != 0) {
+        log_warn("flock failed on " + lock_file.string());
+        return false;
+    }
+
+    std::string expected_stamp = compute_cache_stamp(tarball, manifest_path);
+    if (expected_stamp.empty()) return false;
+
+    fs::path cache_dir = image_dir / ".rootfs_cache";
+    fs::path stamp_file = image_dir / ".cache_stamp";
+
+    if (is_cache_valid(cache_dir, stamp_file, expected_stamp)) {
+        return true;
+    }
+
+    fs::path tmp_dir = image_dir / (".cache_tmp_" + std::to_string(getpid()));
+    std::error_code ec;
+    fs::remove_all(tmp_dir, ec);
+    fs::create_directories(tmp_dir, ec);
+    if (ec) {
+        log_warn("Failed to create temporary cache dir: " + tmp_dir.string());
+        return false;
+    }
+
+    if (!run_process({"tar", "-xzf", fs::absolute(tarball).string(),
+                      "-C", fs::absolute(tmp_dir).string()})) {
+        log_warn("Failed to extract tarball to temporary cache");
+        fs::remove_all(tmp_dir, ec);
+        return false;
+    }
+
+    fs::remove_all(cache_dir, ec);
+    fs::rename(tmp_dir, cache_dir, ec);
+    if (ec) {
+        log_warn("Failed to rename temporary cache to rootfs_cache: " + ec.message());
+        fs::remove_all(tmp_dir, ec);
+        return false;
+    }
+
+    std::ofstream ofs(stamp_file);
+    if (ofs.is_open()) {
+        ofs << expected_stamp << "\n";
+        ofs.close();
+    } else {
+        log_warn("Failed to write cache stamp file: " + stamp_file.string());
+    }
+
     return true;
 }
 
@@ -358,6 +457,11 @@ bool ImageManager::build(const std::string& context_dir, const std::string& tag)
     // Clean up build directory
     fs::remove_all(rootfs_tmp);
 
+    // Invalidate any existing template cache for this image tag
+    std::error_code ec_cache;
+    fs::remove_all(image_dir / ".rootfs_cache", ec_cache);
+    fs::remove(image_dir / ".cache_stamp", ec_cache);
+
     m.size_bytes = fs::file_size(tarball);
     log_info("Image " + tag + " built (" + std::to_string(m.size_bytes / 1024) + " KiB)");
     return true;
@@ -461,9 +565,52 @@ bool ImageManager::extract(const std::string& tag, const std::string& dest_path)
             return false;
         }
     }
+
+    fs::path image_dir = tarball.parent_path();
+    fs::path manifest_path = image_dir / "manifest.json";
+    fs::path cache_dir = image_dir / ".rootfs_cache";
+    fs::path stamp_file = image_dir / ".cache_stamp";
+    fs::path lock_file = image_dir / ".cache.lock";
+
+    std::string expected_stamp = compute_cache_stamp(tarball, manifest_path);
+
+    bool cache_ready = false;
+    if (is_cache_valid(cache_dir, stamp_file, expected_stamp)) {
+        cache_ready = true;
+    } else {
+        cache_ready = ensure_cache(image_dir, tarball, manifest_path);
+    }
+
     fs::create_directories(dest_path);
+
+    if (cache_ready) {
+        int lock_fd = open(lock_file.c_str(), O_RDONLY | O_CLOEXEC, 0644);
+        if (lock_fd >= 0) {
+            flock(lock_fd, LOCK_SH);
+        }
+
+        bool copy_ok = run_process({"cp", "-a", "--reflink=auto",
+                                    (cache_dir / ".").string(),
+                                    (fs::path(dest_path) / ".").string()});
+
+        if (lock_fd >= 0) {
+            flock(lock_fd, LOCK_UN);
+            close(lock_fd);
+        }
+
+        if (copy_ok) {
+            return true;
+        }
+
+        log_warn("cp -a --reflink=auto from cache failed, falling back to direct tar extraction");
+        std::error_code ec;
+        fs::remove_all(dest_path, ec);
+        fs::create_directories(dest_path, ec);
+    }
+
     return run_process({"tar", "-xzf", fs::absolute(tarball).string(),
                         "-C", fs::absolute(dest_path).string()});
 }
+
 
 } // namespace kernelbox::image
