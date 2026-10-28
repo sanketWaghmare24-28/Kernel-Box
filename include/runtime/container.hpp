@@ -1,5 +1,5 @@
 // KernelBox — Container Runtime
-// Orchestrates container lifecycle: create, start, stop, remove, list, logs
+// Orchestrates container lifecycle: create, start, stop, restart, remove, list, logs, pause, unpause, exec, inspect
 
 #pragma once
 #include <string>
@@ -26,8 +26,11 @@ public:
     /// Stop a running container (SIGTERM then SIGKILL after timeout).
     bool stop(const std::string& id_or_name, int timeout_seconds = 10);
 
-    /// Remove a container (stop first if running, then delete on disk).
-    bool remove(const std::string& id_or_name);
+    /// Restart a container (stop if running, then start).
+    bool restart(const std::string& id_or_name, int timeout_seconds = 10);
+
+    /// Remove a container. If running, requires force=true or returns false.
+    bool remove(const std::string& id_or_name, bool force = false);
 
     /// List all containers, auto-correcting stale RUNNING states.
     std::vector<ContainerState> list();
@@ -37,6 +40,18 @@ public:
 
     /// Read container logs.
     std::string logs(const std::string& id_or_name);
+
+    /// Execute a command or interactive shell inside a running container (like docker exec).
+    int exec(const std::string& id_or_name, const std::vector<std::string>& command);
+
+    /// Inspect container details in formatted JSON (like docker inspect).
+    std::string inspect(const std::string& id_or_name);
+
+    /// Freeze all container processes (like docker pause).
+    bool pause(const std::string& id_or_name);
+
+    /// Unfreeze all container processes (like docker unpause).
+    bool unpause(const std::string& id_or_name);
 
 private:
     std::string containers_dir_ = CONTAINERS_DIR;

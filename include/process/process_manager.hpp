@@ -5,6 +5,7 @@
 #include <string>
 #include <vector>
 #include <functional>
+#include <cstdint>
 #include <sys/types.h>
 
 namespace kernelbox::process {
@@ -28,11 +29,14 @@ public:
     /// Block until pid exits. Returns exit code (or 128+signal).
     int wait_for(pid_t pid);
 
-    /// Send a signal to the process.
-    bool send_signal(pid_t pid, int signal);
+    /// Read process start time in clock ticks from /proc/<pid>/stat.
+    uint64_t get_start_time(pid_t pid);
 
-    /// Check if the process is still alive.
-    bool is_running(pid_t pid);
+    /// Send a signal to the process, verifying expected_start_time to prevent PID reuse.
+    bool send_signal(pid_t pid, int signal, uint64_t expected_start_time = 0);
+
+    /// Check if the process is still alive. If expected_start_time > 0, prevents PID reuse.
+    bool is_running(pid_t pid, uint64_t expected_start_time = 0);
 };
 
 } // namespace kernelbox::process
