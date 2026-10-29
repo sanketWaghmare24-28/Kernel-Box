@@ -81,9 +81,26 @@ std::string NetworkManager::veth_cont(const std::string& id) {
     return "veth" + id.substr(0, 6) + "c";
 }
 
+// ── Prerequisites ────────────────────────────────────────────────────────────
+
+bool NetworkManager::check_prerequisites() {
+    if (command_runner_) return true; // Unit test mock runner active
+    if (std::system("command -v ip >/dev/null 2>&1") != 0) {
+        log_error("Missing required Linux networking tool 'ip' (iproute2 package). Networking operations cannot proceed.");
+        return false;
+    }
+    if (std::system("command -v iptables >/dev/null 2>&1") != 0) {
+        log_error("Missing required Linux firewall tool 'iptables'. Port mapping and NAT operations cannot proceed.");
+        return false;
+    }
+    return true;
+}
+
 // ── Bridge ───────────────────────────────────────────────────────────────────
 
 bool NetworkManager::setup_bridge() {
+    if (!check_prerequisites()) return false;
+
     // Idempotent: check if bridge already exists
     if (run_cmd("ip link show " + bridge_name_ + " >/dev/null 2>&1")) {
         log_info("Bridge " + bridge_name_ + " already exists");
@@ -135,6 +152,7 @@ bool NetworkManager::setup_bridge() {
 // ── veth pair ────────────────────────────────────────────────────────────────
 
 bool NetworkManager::create_veth_pair(const std::string& container_id, pid_t pid) {
+    if (!check_prerequisites()) return false;
     if (!valid_container_id(container_id) || pid <= 0) return false;
     std::string vh = veth_host(container_id);
     std::string vc = veth_cont(container_id);

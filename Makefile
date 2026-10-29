@@ -30,4 +30,13 @@ test:
 	sh tests/run-linux-tests.sh
 	cd dashboard && npm test
 
-.PHONY: all clean test
+test-networking:
+	sudo bash tests/test_scenario_e_networking.sh
+
+test-lifecycle:
+	sudo bash tests/test_scenario_g_lifecycle.sh
+
+test-cache:
+	sudo bash tests/test_scenario_f_cache.sh
+
+.PHONY: all clean test test-networking test-lifecycle test-cache

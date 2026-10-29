@@ -11,6 +11,8 @@
 #include <unistd.h>
 #include <cstring>
 #include <iostream>
+#include <fstream>
+#include <sstream>
 
 namespace kernelbox::process {
 
@@ -207,7 +209,41 @@ int ProcessManager::wait_for(pid_t pid) {
     return -1;
 }
 
-bool ProcessManager::send_signal(pid_t pid, int sig) {
+uint64_t ProcessManager::get_start_time(pid_t pid) {
+    if (pid <= 0) return 0;
+    std::string path = "/proc/" + std::to_string(pid) + "/stat";
+    std::ifstream ifs(path);
+    if (!ifs) return 0;
+    std::string line;
+    if (!std::getline(ifs, line)) return 0;
+
+    auto close_paren = line.rfind(')');
+    if (close_paren == std::string::npos || close_paren + 2 >= line.size()) return 0;
+    std::istringstream iss(line.substr(close_paren + 2));
+
+    char state;
+    if (!(iss >> state)) return 0;
+    uint64_t dummy = 0;
+    for (int i = 4; i < 22; ++i) {
+        if (!(iss >> dummy)) return 0;
+    }
+    uint64_t starttime = 0;
+    if (iss >> starttime) {
+        return starttime;
+    }
+    return 0;
+}
+
+bool ProcessManager::send_signal(pid_t pid, int sig, uint64_t expected_start_time) {
+    if (pid <= 0) return false;
+    if (expected_start_time > 0) {
+        uint64_t actual = get_start_time(pid);
+        if (actual == 0 || actual != expected_start_time) {
+            log_warn("Refusing to send signal " + std::to_string(sig) + " to PID " +
+                     std::to_string(pid) + ": PID reuse detected (start time mismatch)");
+            return false;
+        }
+    }
     if (kill(pid, sig) == -1) {
         log_error("kill(" + std::to_string(pid) + ", " + std::to_string(sig) + "): " + strerror(errno));
         return false;
@@ -215,8 +251,17 @@ bool ProcessManager::send_signal(pid_t pid, int sig) {
     return true;
 }
 
-bool ProcessManager::is_running(pid_t pid) {
-    if (kill(pid, 0) == -1) return (errno != ESRCH);
+bool ProcessManager::is_running(pid_t pid, uint64_t expected_start_time) {
+    if (pid <= 0) return false;
+    if (kill(pid, 0) == -1) {
+        if (errno == ESRCH) return false;
+    }
+    if (expected_start_time > 0) {
+        uint64_t actual = get_start_time(pid);
+        if (actual == 0 || actual != expected_start_time) {
+            return false; // PID was reused!
+        }
+    }
     return true;
 }
 

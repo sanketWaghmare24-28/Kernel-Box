@@ -96,6 +96,18 @@ bool setup_mounts(const std::string& rootfs_path) {
     if (!do_mount("tmpfs",  "dev",  "tmpfs",  MS_NOSUID | MS_STRICTATIME, "mode=755"))     return false;
     if (!do_mount("devpts", "dev/pts", "devpts", MS_NOSUID | MS_NOEXEC, "newinstance,ptmxmode=0666")) return false;
 
+    // Mask sensitive kernel paths inside container procfs
+    auto mask_file = [&](const std::string& rel) {
+        fs::path p = fs::path(rootfs_path) / rel;
+        std::error_code ec;
+        if (fs::exists(p, ec)) {
+            mount("/dev/null", p.c_str(), nullptr, MS_BIND, nullptr);
+            mount(nullptr, p.c_str(), nullptr, MS_BIND | MS_REMOUNT | MS_RDONLY, nullptr);
+        }
+    };
+    mask_file("proc/sysrq-trigger");
+    mask_file("proc/kcore");
+
     log_info("Mounts set up in rootfs");
     return true;
 }
@@ -166,8 +178,17 @@ bool do_pivot_root(const std::string& new_root) {
     }
 
     if (syscall(SYS_pivot_root, new_root.c_str(), put_old.c_str()) != 0) {
-        log_error("pivot_root: " + std::string(strerror(errno)));
-        return false;
+        log_warn("pivot_root returned error (" + std::string(strerror(errno)) + "), attempting chroot fallback");
+        if (chroot(new_root.c_str()) != 0) {
+            log_error("chroot fallback failed: " + std::string(strerror(errno)));
+            return false;
+        }
+        if (chdir("/") != 0) {
+            log_error("chdir / after chroot failed: " + std::string(strerror(errno)));
+            return false;
+        }
+        log_warn("Container running under chroot fallback (security boundary is pathname-only)");
+        return true;
     }
 
     if (chdir("/") != 0) {
@@ -191,8 +212,11 @@ bool do_pivot_root(const std::string& new_root) {
 bool cleanup_rootfs(const std::string& rootfs_path) {
     auto try_umount = [&](const std::string& rel) {
         fs::path p = fs::path(rootfs_path) / rel;
-        if (umount2(p.c_str(), 0) != 0) {
-            umount2(p.c_str(), MNT_DETACH); // lazy fallback
+        std::error_code ec;
+        if (fs::exists(p, ec)) {
+            if (umount2(p.c_str(), 0) != 0) {
+                umount2(p.c_str(), MNT_DETACH); // lazy fallback
+            }
         }
     };
 
@@ -201,6 +225,7 @@ bool cleanup_rootfs(const std::string& rootfs_path) {
     try_umount("tmp");
     try_umount("sys");
     try_umount("proc");
+    try_umount(""); // rootfs bind mount itself
 
     log_info("Rootfs cleanup done");
     return true;

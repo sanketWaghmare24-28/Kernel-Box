@@ -10,12 +10,17 @@
 #include <cstring>
 #include <cctype>
 #include <unistd.h>
+#include <sys/vfs.h>
 
 namespace fs = std::filesystem;
 
 namespace kernelbox::cgroups {
 
 namespace {
+
+#ifndef CGROUP2_SUPER_MAGIC
+constexpr unsigned long CGROUP2_SUPER_MAGIC = 0x63677270;
+#endif
 
 bool valid_container_id(const std::string& id) {
     if (id.size() != 12) return false;
@@ -26,6 +31,41 @@ bool valid_container_id(const std::string& id) {
 }
 
 } // namespace
+
+bool CgroupManager::is_cgroup_v2_supported() {
+    std::error_code ec;
+    if (fs::exists("/sys/fs/cgroup/cgroup.controllers", ec)) {
+        return true;
+    }
+    struct statfs sfs{};
+    if (statfs("/sys/fs/cgroup", &sfs) == 0) {
+        return static_cast<unsigned long>(sfs.f_type) == CGROUP2_SUPER_MAGIC;
+    }
+    return false;
+}
+
+bool CgroupManager::check_permissions() {
+    if (!is_cgroup_v2_supported()) {
+        log_error("System does not support a unified cgroups v2 hierarchy at /sys/fs/cgroup");
+        return false;
+    }
+
+    std::error_code ec;
+    if (!fs::exists(base_path_, ec)) {
+        // Test parent directory write access
+        fs::path parent = fs::path(base_path_).parent_path();
+        if (access(parent.c_str(), W_OK | X_OK) != 0) {
+            log_error("Insufficient permissions to create cgroup root under " + parent.string());
+            return false;
+        }
+    } else {
+        if (access(base_path_.c_str(), W_OK | X_OK) != 0) {
+            log_error("Insufficient permissions to manage cgroups in " + base_path_);
+            return false;
+        }
+    }
+    return true;
+}
 
 std::string CgroupManager::cgroup_path(const std::string& container_id) const {
     return base_path_ + "/" + container_id;
@@ -144,7 +184,9 @@ CgroupStats CgroupManager::get_stats(const std::string& container_id) {
     std::istringstream css(cpu_stat);
     std::string key; uint64_t val;
     while (css >> key >> val) {
-        if (key == "usage_usec") { stats.cpu_usage_usec = val; break; }
+        if (key == "usage_usec") stats.cpu_usage_usec = val;
+        else if (key == "user_usec") stats.cpu_user_usec = val;
+        else if (key == "system_usec") stats.cpu_system_usec = val;
     }
 
     // Memory
@@ -154,11 +196,32 @@ CgroupStats CgroupManager::get_stats(const std::string& container_id) {
     stats.memory_current = safe_ull(read_file(base + "/memory.current"));
     std::string mem_max  = read_file(base + "/memory.max");
     stats.memory_limit   = (mem_max == "max") ? 0 : safe_ull(mem_max);
+    stats.memory_peak    = safe_ull(read_file(base + "/memory.peak"));
+
+    // Memory events (OOM kills)
+    std::string mem_events = read_file(base + "/memory.events");
+    std::istringstream mess(mem_events);
+    while (mess >> key >> val) {
+        if (key == "oom_kill") stats.oom_kills = val;
+        else if (key == "oom") stats.oom_count = val;
+    }
 
     // PIDs
     stats.pids_current   = safe_ull(read_file(base + "/pids.current"));
 
     return stats;
+}
+
+bool CgroupManager::freeze(const std::string& container_id, bool freeze_state) {
+    if (!valid_container_id(container_id)) return false;
+    std::string path = cgroup_path(container_id) + "/cgroup.freeze";
+    std::string val = freeze_state ? "1" : "0";
+    if (!write_file(path, val)) {
+        log_error("Failed to write " + val + " to " + path);
+        return false;
+    }
+    log_info((freeze_state ? "Froze (paused) cgroup " : "Thawed (unpaused) cgroup ") + container_id);
+    return true;
 }
 
 bool CgroupManager::remove(const std::string& container_id) {

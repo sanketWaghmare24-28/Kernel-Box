@@ -23,7 +23,9 @@ enum class ContainerStatus {
     CREATED  = 0,
     RUNNING  = 1,
     STOPPED  = 2,
-    REMOVING = 3
+    REMOVING = 3,
+    PAUSED   = 4,
+    FAILED   = 5
 };
 
 inline std::string status_to_string(ContainerStatus s) {
@@ -32,6 +34,8 @@ inline std::string status_to_string(ContainerStatus s) {
         case ContainerStatus::RUNNING:  return "Running";
         case ContainerStatus::STOPPED:  return "Stopped";
         case ContainerStatus::REMOVING: return "Removing";
+        case ContainerStatus::PAUSED:   return "Paused";
+        case ContainerStatus::FAILED:   return "Failed";
     }
     return "Unknown";
 }
@@ -59,12 +63,16 @@ struct ContainerState {
     std::string     id;
     std::string     name;
     std::string     image;
-    pid_t           pid        = 0;
-    ContainerStatus status     = ContainerStatus::CREATED;
+    pid_t           pid              = 0;
+    uint64_t        start_time_ticks = 0;   // Process start time from /proc/<pid>/stat
+    ContainerStatus status           = ContainerStatus::CREATED;
     std::string     created_at;
-    int             exit_code  = -1;
-    std::string     cpu_limit;     // e.g. "50000 100000"
-    std::string     memory_limit;  // bytes as string
+    std::string     started_at;
+    std::string     finished_at;
+    int             exit_code        = -1;
+    std::string     cpu_limit;              // e.g. "50000 100000"
+    std::string     memory_limit;           // bytes as string
+    std::string     error_message;
 };
 
 // ── Path Constants ───────────────────────────────────────────────────────────
@@ -157,6 +165,19 @@ inline int get_int(const std::string& json, const std::string& key) {
     auto end = json.find_first_of(",}\n", pos);
     if (end == std::string::npos) return 0;
     try { return std::stoi(json.substr(pos, end - pos)); }
+    catch (...) { return 0; }
+}
+
+/// Extract an unsigned 64-bit integer value for the given key.
+inline uint64_t get_uint64(const std::string& json, const std::string& key) {
+    std::string search = "\"" + key + "\"";
+    auto pos = json.find(search);
+    if (pos == std::string::npos) return 0;
+    pos += search.length();
+    while (pos < json.size() && (json[pos] == ':' || json[pos] == ' ' || json[pos] == '\t')) pos++;
+    auto end = json.find_first_of(",}\n", pos);
+    if (end == std::string::npos) return 0;
+    try { return std::stoull(json.substr(pos, end - pos)); }
     catch (...) { return 0; }
 }
 

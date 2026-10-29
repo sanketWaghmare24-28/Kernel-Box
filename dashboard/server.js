@@ -138,18 +138,21 @@ app.get('/api/stats/:id', async (req, res) => {
         if (line.startsWith('CPU Usage:')) {
             const raw = line.replace('CPU Usage:', '').trim();
             stats.cpu_raw = raw;
-            stats.cpu_ms = parseFloat(raw) || 0;
+            const ms = parseInt(raw, 10);
+            if (!isNaN(ms)) stats.cpu_ms = ms;
         } else if (line.startsWith('Memory:')) {
             const raw = line.replace('Memory:', '').trim();
             stats.memory_raw = raw;
-            // Examples: "15 MB / 128 MB" or "15 MB"
-            const match = raw.match(/(\d+(?:\.\d+)?)\s*MB(?:\s*\/\s*(\d+(?:\.\d+)?)\s*MB)?/i);
-            if (match) {
-                stats.memory_mb = parseFloat(match[1]) || 0;
-                stats.memory_limit_mb = match[2] ? parseFloat(match[2]) : 128;
+            const parts = raw.split('/');
+            const used = parseInt(parts[0], 10);
+            if (!isNaN(used)) stats.memory_mb = used;
+            if (parts.length > 1) {
+                const limit = parseInt(parts[1], 10);
+                if (!isNaN(limit)) stats.memory_limit_mb = limit;
             }
         } else if (line.startsWith('Processes:')) {
-            stats.procs = parseInt(line.replace('Processes:', '').trim(), 10) || 0;
+            const p = parseInt(line.replace('Processes:', '').trim(), 10);
+            if (!isNaN(p)) stats.procs = p;
         }
     }
 
@@ -163,12 +166,12 @@ app.get('/api/logs/:id', async (req, res) => {
     }
     const { success, output } = await runCmd('logs', [req.params.id]);
     if (!success) {
-        return res.status(404).json({ error: 'Could not fetch logs', logs: [] });
+        return res.status(404).json({ error: 'Failed to fetch logs' });
     }
 
-    const rawLines = output.split('\n').filter(Boolean);
+    const rawLines = output.split('\n');
     const parsedLogs = rawLines.map((line, idx) => {
-        // Format: [2024-01-15T10:30:00Z] [stdout] line content OR raw text
+        // [2026-01-15T10:30:00Z] [stdout] line content OR raw text
         const match = line.match(/^\[(.*?)\]\s*\[(.*?)\]\s*(.*)$/);
         if (match) {
             return {
@@ -264,6 +267,14 @@ app.get('/api/health/:id', async (req, res) => {
 });
 
 // 5. Container lifecycle controls
+app.post('/api/containers/:id/start', async (req, res) => {
+    if (!validContainerId(req.params.id)) {
+        return res.status(400).json({ error: 'Invalid container ID' });
+    }
+    const { success, output } = await runCmd('start', [req.params.id]);
+    res.json({ success, output });
+});
+
 app.post('/api/containers/:id/stop', async (req, res) => {
     if (!validContainerId(req.params.id)) {
         return res.status(400).json({ error: 'Invalid container ID' });
@@ -272,11 +283,50 @@ app.post('/api/containers/:id/stop', async (req, res) => {
     res.json({ success, output });
 });
 
+app.post('/api/containers/:id/restart', async (req, res) => {
+    if (!validContainerId(req.params.id)) {
+        return res.status(400).json({ error: 'Invalid container ID' });
+    }
+    const { success, output } = await runCmd('restart', [req.params.id]);
+    res.json({ success, output });
+});
+
 app.post('/api/containers/:id/rm', async (req, res) => {
     if (!validContainerId(req.params.id)) {
         return res.status(400).json({ error: 'Invalid container ID' });
     }
     const { success, output } = await runCmd('rm', [req.params.id]);
+    res.json({ success, output });
+});
+
+app.get('/api/containers/:id/inspect', async (req, res) => {
+    if (!validContainerId(req.params.id)) {
+        return res.status(400).json({ error: 'Invalid container ID' });
+    }
+    const { success, output } = await runCmd('inspect', [req.params.id]);
+    if (!success) {
+        return res.status(500).json({ error: 'Failed to inspect container', output });
+    }
+    try {
+        res.json(JSON.parse(output));
+    } catch (_) {
+        res.json({ raw: output });
+    }
+});
+
+app.post('/api/containers/:id/pause', async (req, res) => {
+    if (!validContainerId(req.params.id)) {
+        return res.status(400).json({ error: 'Invalid container ID' });
+    }
+    const { success, output } = await runCmd('pause', [req.params.id]);
+    res.json({ success, output });
+});
+
+app.post('/api/containers/:id/unpause', async (req, res) => {
+    if (!validContainerId(req.params.id)) {
+        return res.status(400).json({ error: 'Invalid container ID' });
+    }
+    const { success, output } = await runCmd('unpause', [req.params.id]);
     res.json({ success, output });
 });
 
@@ -296,7 +346,7 @@ app.get('/api/system', (req, res) => {
             'Network Namespace (CLONE_NEWNET + veth pairs)',
             'UTS Namespace (CLONE_NEWUTS)',
             'IPC Namespace (CLONE_NEWIPC)',
-            'Cgroups v2 (cpu.max + memory.max)'
+            'Cgroups v2 (cpu.max + memory.max + cgroup.freeze)'
         ]
     });
 });

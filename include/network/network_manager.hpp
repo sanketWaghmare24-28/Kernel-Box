@@ -18,6 +18,9 @@ public:
         : command_runner_(std::move(command_runner)),
           containers_dir_(std::move(containers_dir)) {}
 
+    /// Verify that required host networking tools (ip, iptables) are installed and available.
+    bool check_prerequisites();
+
     /// Create the host bridge (kb0) with IP 10.0.100.1/24, enable forwarding.
     bool setup_bridge();
 
